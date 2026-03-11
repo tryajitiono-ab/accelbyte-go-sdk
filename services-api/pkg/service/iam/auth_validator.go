@@ -12,6 +12,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/big"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -527,6 +528,49 @@ func (v *TokenValidator) fetchNamespaceContextFromCache(keyNamespace string) err
 
 	err := v.fetchNamespaceContext(keyNamespace)
 	if err != nil {
+		// Failed to fetch context for claims.Namespace (likely a parent namespace
+		// the app doesn't have permission to query). Fall back to fetching the
+		// app's own game namespace and derive the hierarchy from it.
+		appNamespace := os.Getenv("AB_NAMESPACE")
+		if appNamespace == "" || appNamespace == keyNamespace {
+			return err
+		}
+
+		if fallbackErr := v.fetchNamespaceContext(appNamespace); fallbackErr != nil {
+			return err
+		}
+
+		if appContext, found := v.namespaceContextsCache.Get(appNamespace); found {
+			gameCtx := appContext.(*NamespaceContext)
+			expiration := utils.GetNamespaceContextExpirationTime()
+
+			if gameCtx.StudioNamespace != "" {
+				v.namespaceContextsCache.Set(gameCtx.StudioNamespace, &NamespaceContext{
+					Namespace:          gameCtx.StudioNamespace,
+					Type:               TypeStudio,
+					PublisherNamespace: gameCtx.PublisherNamespace,
+					StudioNamespace:    "",
+				}, expiration)
+			}
+
+			if gameCtx.PublisherNamespace != "" {
+				v.namespaceContextsCache.Set(gameCtx.PublisherNamespace, &NamespaceContext{
+					Namespace:          gameCtx.PublisherNamespace,
+					Type:               TypePublisher,
+					PublisherNamespace: "",
+					StudioNamespace:    "",
+				}, expiration)
+			}
+
+			if nsContext, found := v.namespaceContextsCache.Get(keyNamespace); found {
+				v.RWMutex.Lock()
+				defer v.RWMutex.Unlock()
+				v.NamespaceContexts = map[string]*NamespaceContext{keyNamespace: nsContext.(*NamespaceContext)}
+
+				return nil
+			}
+		}
+
 		return err
 	}
 
